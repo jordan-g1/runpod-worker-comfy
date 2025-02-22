@@ -1,27 +1,45 @@
 # Stage 1: Base image with common dependencies
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04 as base
 
-# Prevents prompts from packages asking for user input during installation
+# Environment variables
 ENV DEBIAN_FRONTEND=noninteractive
-# Prefer binary wheels over source distributions for faster pip installations
 ENV PIP_PREFER_BINARY=1
-# Ensures output from python is printed immediately to the terminal without buffering
 ENV PYTHONUNBUFFERED=1 
-# Speed up some cmake builds
 ENV CMAKE_BUILD_PARALLEL_LEVEL=8
 
-# Install Python, git and other necessary tools
+# Install Python, git and other necessary tools plus additional dependencies for custom nodes
 RUN apt-get update && apt-get install -y \
     python3.10 \
     python3-pip \
     git \
     wget \
     libgl1 \
+    ffmpeg \
+    libzbar0 \
+    libopencv-dev \
+    python3-opencv \
+    build-essential \
+    cmake \
     && ln -sf /usr/bin/python3.10 /usr/bin/python \
-    && ln -sf /usr/bin/pip3 /usr/bin/pip
+    && ln -sf /usr/bin/pip3 /usr/bin/pip \
+    && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
-# Clean up to reduce image size
-RUN apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+# Copy snapshot file early to use for pip installations
+COPY 2025-02-21_17-25-15_snapshot.json /
+
+# Install pip dependencies from snapshot
+RUN pip install --no-cache-dir $(python3 -c "import json; print(' '.join([k for k, v in json.load(open('/2025-02-21_17-25-15_snapshot.json'))['pips'].items() if not v.startswith('git+')]))")
+
+# Handle git dependencies separately
+RUN pip install git+https://github.com/openai/swarm.git@9db581cecaacea0d46a933d6453c312b034dbf47
+
+# Additional dependencies for specific nodes
+RUN pip install --no-cache-dir \
+    segment-anything-pt2 \
+    opencv-contrib-python --upgrade \
+    ultralytics \
+    supervision \
+    mediapipe
 
 # Install comfy-cli
 RUN pip install comfy-cli
@@ -45,9 +63,6 @@ WORKDIR /
 ADD src/start.sh src/restore_snapshot.sh src/rp_handler.py test_input.json ./
 RUN chmod +x /start.sh /restore_snapshot.sh
 
-# Optionally copy the snapshot file
-ADD *snapshot*.json /
-
 # Restore the snapshot to install custom nodes
 RUN /restore_snapshot.sh
 
@@ -56,34 +71,53 @@ CMD ["/start.sh"]
 
 # Stage 2: Download models
 FROM base as downloader
-
 ARG HUGGINGFACE_ACCESS_TOKEN
 ARG MODEL_TYPE
 
 # Change working directory to ComfyUI
 WORKDIR /comfyui
 
-# Create necessary directories
-RUN mkdir -p models/checkpoints models/vae
+# Create all necessary directories
+RUN mkdir -p \
+    models/checkpoints \
+    models/vae \
+    models/clip \
+    models/unet \
+    models/yolo \
+    models/controlnet \
+    models/sam \
+    models/clip_interrogator \
+    models/prompt_generator \
+    models/segment_anything \
+    models/depth_anything
 
-# Download checkpoints/vae/LoRA to include in image based on model type
-RUN if [ "$MODEL_TYPE" = "sdxl" ]; then \
-      wget -O models/checkpoints/sd_xl_base_1.0.safetensors https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors && \
-      wget -O models/vae/sdxl_vae.safetensors https://huggingface.co/stabilityai/sdxl-vae/resolve/main/sdxl_vae.safetensors && \
-      wget -O models/vae/sdxl-vae-fp16-fix.safetensors https://huggingface.co/madebyollin/sdxl-vae-fp16-fix/resolve/main/sdxl_vae.safetensors; \
-    elif [ "$MODEL_TYPE" = "sd3" ]; then \
-      wget --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/checkpoints/sd3_medium_incl_clips_t5xxlfp8.safetensors https://huggingface.co/stabilityai/stable-diffusion-3-medium/resolve/main/sd3_medium_incl_clips_t5xxlfp8.safetensors; \
-    elif [ "$MODEL_TYPE" = "flux1-schnell" ]; then \
+# Download FLUX models if specified
+RUN if [ "$MODEL_TYPE" = "flux1-schnell" ]; then \
       wget -O models/unet/flux1-schnell.safetensors https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors && \
       wget -O models/clip/clip_l.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors && \
       wget -O models/clip/t5xxl_fp8_e4m3fn.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors && \
       wget -O models/vae/ae.safetensors https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors; \
-    elif [ "$MODEL_TYPE" = "flux1-dev" ]; then \
-      wget --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/unet/flux1-dev.safetensors https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors && \
-      wget -O models/clip/clip_l.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors && \
-      wget -O models/clip/t5xxl_fp8_e4m3fn.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors && \
-      wget --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/vae/ae.safetensors https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors; \
     fi
+
+# YOLO models
+RUN wget -O models/yolo/yolov8n.pt https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt
+
+# ControlNet models
+RUN wget -O models/controlnet/hand_pose_model.pth https://huggingface.co/hr16/ControlNet-HandPose-Annotator/resolve/main/hand_pose_model.pth && \
+    wget -O models/controlnet/dw-ll_ucoco_384.onnx https://huggingface.co/hr16/ControlNet-HandPose-Annotator/resolve/main/dw-ll_ucoco_384.onnx
+
+# SAM2 models
+RUN wget -O models/sam/sam2_b.pth https://dl.fbaipublicfiles.com/segment_anything/sam2/sam2_b.pth
+
+# Clip Interrogator and Prompt Generator models
+RUN wget -O models/clip_interrogator/blip-image-captioning-base.pth https://huggingface.co/Salesforce/blip-image-captioning-base/resolve/main/pytorch_model.bin || true
+RUN wget -O models/prompt_generator/text2image-prompt-generator.pth https://huggingface.co/succinctly/text2image-prompt-generator/resolve/main/pytorch_model.bin || true
+
+# Depth Anything models
+RUN wget -O models/depth_anything/depth_anything_vitl14.pth https://huggingface.co/LiheYoung/depth_anything/resolve/main/depth_anything_vitl14.pth
+
+# Additional models for other nodes that might need them
+RUN wget -O models/sam/sam_vit_h_4b8939.pth https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth || true
 
 # Stage 3: Final image
 FROM base as final
